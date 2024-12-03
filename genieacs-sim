@@ -1,0 +1,166 @@
+#!/usr/bin/env node
+"use strict";
+
+const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
+const cluster = require("cluster");
+const fs = require("fs");
+const path = require("path");
+
+if (cluster.isMaster) {
+  const program = require("commander");
+  const pkg = require("./package.json");
+
+  function resolvePath(p) {
+    return path.resolve(process.cwd(), p);
+  }
+
+  program
+    .version(pkg.version)
+    .description(pkg.description)
+    .option("-u, --acs-url [url]", "ACS URL to contact (default: http://127.0.0.1:7547/)", "http://127.0.0.1:7547/")
+    .option("-m, --data-model [filename]", "Data model template", resolvePath, "./data_model_202BC1-BM632w-8KA8WA1151100043.csv")
+    .option("-p, --processes [count]", "Number of processes to spawn (default: 1)", (value) => parseInt(value, 10), 1)
+    .option("-t, --threads [count]", "Number of threads per process (default: 10)", parseInt, 10)
+    .option("-w, --wait [milliseconds]", "Waiting period between process spawning (default: 5000)", (value) => {
+        const parsedValue = parseInt(value, 10);
+    	    if (isNaN(parsedValue)) {
+                console.error(`Invalid wait time provided: ${value}. Using default of 5000ms.`);
+                return 5000; // Fallback to default value if invalid
+            }
+        return parsedValue;
+    }, 5000)
+    .option("-W, --thread-wait [milliseconds]", "Wait time between threads being spawned", (value) => parseInt(value, 10), 20)
+    .option("-s, --serial [offset]", "Serial number offset (default: 0)", parseInt, 0)
+    .parse(process.argv);
+
+  if (!/^(http|https):\/\//.test(program.acsUrl)) {
+    console.error("Invalid ACS URL");
+    process.exit(1);
+  }
+
+  const workers = [];
+
+  console.log("Starting the GenieACS Simulator...");
+  console.log(`ACS URL: ${program.acsUrl}`);
+  console.log(`Data model file: ${program.dataModel}`);
+  console.log(`Processes: ${program.processes}, Threads per process: ${program.threads}`);
+  console.log(`Serial offset: ${program.serial}`);
+  console.log("-----------------------------------------------------");
+  
+  // Function to spawn a process after a delay
+  function spawnProcessWithDelay(i) {
+    return new Promise(resolve => {
+      setTimeout(() => {
+        const env = {
+          THREAD_COUNT: program.threads,
+          SERIAL_START: program.serial + i * program.threads,
+          ACS_URL: program.acsUrl,
+          DATA_MODEL: program.dataModel,
+	  THREAD_WAIT: program.threadWait,
+        };
+
+        const worker = cluster.fork(env);
+        workers.push(worker);
+
+        console.log(`Started process ${worker.process.pid} with serial range: ${env.SERIAL_START} - ${env.SERIAL_START + program.threads - 1}`);
+        resolve();
+      }, program.wait);  // Delay increases with each process
+    });
+  }
+
+  // Sequentially spawn processes with delay
+  (async function spawnAllProcesses() {
+    for (let i = 0; i < program.processes; i++) {
+      await spawnProcessWithDelay(i);
+    }
+  })();
+
+  // Gracefully shut down on Ctrl+C
+  process.on("SIGINT", () => {
+    console.log("\nShutting down...");
+    workers.forEach(worker => worker.process.kill());
+    process.exit();
+  });
+
+  cluster.on("exit", (worker, code, signal) => {
+    console.log(`Process ${worker.process.pid} exited (${signal || code}).`);
+  });
+} else {
+  const THREAD_COUNT = parseInt(process.env["THREAD_COUNT"]);
+  const SERIAL_START = parseInt(process.env["SERIAL_START"]);
+  const ACS_URL = process.env["ACS_URL"];
+  const DATA_MODEL = process.env["DATA_MODEL"];
+  const THREAD_WAIT = parseInt(process.env["THREAD_WAIT"]);
+
+  let device;
+
+  console.log(`Process ${process.pid} initializing...`);
+
+  try {
+    const data = fs.readFileSync(DATA_MODEL);
+    if (path.parse(DATA_MODEL).ext.toLowerCase() === ".csv") {
+      const csvParser = require("./csv-parser");
+      const rows = csvParser.reduce(csvParser.parseCsv(data.toString()));
+      device = {};
+
+      for (const row of rows) {
+        const isObject = row["Object"] === "true";
+        let id = row["Parameter"];
+        if (isObject) id += ".";
+
+        device[id] = [row["Writable"] === "true"];
+        if (!isObject) {
+          device[id].push(row["Value"] || "");
+          if (row["Value type"] != null) device[id].push(row["Value type"]);
+        }
+      }
+    } else {
+      device = JSON.parse(data);
+    }
+    console.log(`Loaded data model for process ${process.pid}`);
+  } catch (err) {
+    console.error(`Error reading or parsing the data model in process ${process.pid}:`, err);
+    process.exit(1);
+  }
+
+  // Spawn threads for each simulator
+  async function spawnThreadsWithDelay() {
+    for (let i = 0; i < THREAD_COUNT; i++) {
+      const serialNumber = `00000${SERIAL_START + i}`.slice(-6);
+
+      // Wait for the specified amount of time between threads
+      if (i > 0) {
+        console.log(`Waiting for ${THREAD_WAIT}ms before spawning the next thread...`);
+        await new Promise(resolve => setTimeout(resolve, THREAD_WAIT));
+      }
+
+      const worker = new Worker(`
+        const { parentPort, workerData } = require('worker_threads');
+        const simulator = require('./simulator');
+
+        simulator.start(workerData.device, workerData.serialNumber, workerData.acsUrl);
+
+        parentPort.postMessage({ status: 'done', serial: workerData.serialNumber });
+      `, {
+        eval: true,
+        workerData: { device, serialNumber, acsUrl: ACS_URL },
+      });
+
+      worker.on("message", msg => {
+        console.log(`Simulator ${msg.serial} completed.`);
+      });
+
+      worker.on("error", err => {
+        console.error(`Error in simulator thread for serial ${serialNumber}:`, err);
+      });
+
+      worker.on("exit", code => {
+        if (code !== 0) {
+          console.error(`Simulator thread for serial ${serialNumber} exited with code ${code}.`);
+        }
+      });
+    }
+  }
+
+  spawnThreadsWithDelay();
+}
